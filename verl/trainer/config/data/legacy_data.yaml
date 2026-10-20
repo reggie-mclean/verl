@@ -13,6 +13,14 @@ train_files: ~/data/rlhf/gsm8k/train.parquet
 # Validation parquet. Can be a list or a single file.
 val_files: ~/data/rlhf/gsm8k/test.parquet
 
+# Optional relative mixing weights for multiple training datasets, one float per entry in
+# train_files (e.g. train_files: [cdc.parquet, hvta.parquet], train_weights: [0.8, 0.2]).
+# Each source file is resampled (oversampled with replacement, or undersampled without) so the
+# combined training pool reflects these ratios instead of each file's raw row count, then
+# concatenated as usual. Weights are normalized to sum to 1 and only apply to the training
+# split -- val_files is always concatenated as-is. Leave null to use raw file sizes (default).
+train_weights: null
+
 # Maximum sample length to be used.
 # Set to -1 to use full dataset, otherwise, randomly
 # select the specified number of samples from train dataset
@@ -33,6 +41,14 @@ reward_fn_key: data_source
 # An error will be reported if the length is too long.
 # oc.select: default val for rollout.prompt_length
 max_prompt_length: 512
+
+# Optional per-file overlong-prompt thresholds for multiple training datasets, one int per entry
+# in train_files (e.g. train_files: [babyai.parquet, hvta.parquet], max_prompt_lengths: [512,
+# 2048]). Each source file is filtered against its own threshold before concatenation (and before
+# train_weights resampling) instead of every file sharing max_prompt_length. Only applies to the
+# training split -- val_files always uses max_prompt_length. Leave null to use max_prompt_length
+# for every file (default).
+max_prompt_lengths: null
 
 # Maximum response length. Rollout in RL algorithms (e.g. PPO) generates up to this length.
 # oc.select: default val for rollout.response_length

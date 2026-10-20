@@ -16,6 +16,7 @@
 
 import asyncio
 import copy
+import json
 import logging
 import os
 import re
@@ -69,6 +70,177 @@ def collate_fn(data_list: list[dict]) -> dict:
     return {**tensors, **non_tensors}
 
 
+def _resample_dataframes_to_weights(dataframes: list, weights: list, seed: Optional[int] = None) -> list:
+    """Resample each split so its row count reflects `weights` instead of its raw file size.
+
+    Each entry in ``dataframes`` is oversampled (with replacement) or undersampled
+    (without replacement) to ``round(normalized_weight_i * total_rows)`` rows, where
+    ``total_rows`` is the sum of the original per-file counts -- the combined pool size
+    stays the same, only the proportion contributed by each source dataset changes. This
+    lets e.g. a small HVTA split be upsampled to match a much larger CDC split without
+    hand-building a pre-mixed parquet offline.
+    """
+    if len(weights) != len(dataframes):
+        raise ValueError(
+            f"data.train_weights has {len(weights)} entries but data.train_files has {len(dataframes)} "
+            "entries; they must be the same length."
+        )
+    weights_arr = np.asarray(weights, dtype=np.float64)
+    if (weights_arr < 0).any() or weights_arr.sum() <= 0:
+        raise ValueError(f"data.train_weights must be non-negative and sum to > 0, got {list(weights)}")
+    weights_arr = weights_arr / weights_arr.sum()
+
+    total_rows = sum(len(frame) for frame in dataframes)
+    rng = np.random.default_rng(seed)
+    resampled = []
+    for frame, weight in zip(dataframes, weights_arr):
+        target = round(weight * total_rows)
+        n = len(frame)
+        if n == 0:
+            if target == 0:
+                resampled.append(frame)
+                continue
+            raise ValueError("Cannot resample an empty dataset split to a non-zero target row count.")
+        if target == n:
+            resampled.append(frame)
+        else:
+            indices = rng.choice(n, size=target, replace=target > n)
+            resampled.append(frame.select(indices.tolist()))
+    return resampled
+
+
+def concatenate_rl_dataframes(dataframes: list):
+    """Stack parquet splits whose nested schemas differ.
+
+    HuggingFace will not concatenate Countdown-Code ``{target, numbers}`` with a
+    GSM8K string, or HumanEval ``extra_info`` keys with CDC's, or Arrow
+    ``string`` with ``large_string``. Non-string ground truths become JSON
+    (reward functions parse them back); ``extra_info`` is the key union with
+    nulls; missing top-level columns (e.g. HVTA ``agent_name``) are filled;
+    ``large_string`` is cast to ``string``.
+    """
+    if len(dataframes) == 1:
+        return dataframes[0]
+    try:
+        return datasets.concatenate_datasets(dataframes)
+    except ValueError as exc:
+        logger.warning("Parquet schemas differ (%s); aligning nested fields so val files can be stacked.", exc)
+        aligned = [_stringify_reward_ground_truth(frame) for frame in dataframes]
+        aligned = _union_extra_info(aligned)
+        aligned = _union_top_level_columns(aligned)
+        aligned = [_fill_agent_name(frame) for frame in aligned]
+        aligned = [_cast_large_strings(frame) for frame in aligned]
+        return datasets.concatenate_datasets(aligned)
+
+
+def _stringify_reward_ground_truth(dataframe):
+    def _map(example):
+        reward_model = example.get("reward_model")
+        if isinstance(reward_model, dict):
+            ground_truth = reward_model.get("ground_truth")
+            if ground_truth is not None and not isinstance(ground_truth, str):
+                example["reward_model"] = {**reward_model, "ground_truth": json.dumps(ground_truth)}
+        return example
+
+    if "reward_model" not in dataframe.features:
+        return dataframe.map(_map)
+
+    new_features = dataframe.features.copy()
+    new_features["reward_model"] = {**dict(dataframe.features["reward_model"]), "ground_truth": datasets.Value("string")}
+    return dataframe.map(_map, features=new_features)
+
+
+def _union_extra_info(dataframes):
+    merged = {}
+    for frame in dataframes:
+        feat = frame.features.get("extra_info")
+        if feat is None:
+            continue
+        for key, value in dict(feat).items():
+            merged.setdefault(key, value)
+    if not merged:
+        return dataframes
+    preferred = ("split", "index")
+    ordered = {k: merged[k] for k in preferred if k in merged}
+    ordered.update((k, merged[k]) for k in sorted(merged) if k not in ordered)
+
+    def _map(example):
+        extra = dict(example.get("extra_info") or {})
+        example["extra_info"] = {key: extra.get(key) for key in ordered}
+        return example
+
+    aligned = []
+    for frame in dataframes:
+        new_features = frame.features.copy()
+        new_features["extra_info"] = dict(ordered)
+        aligned.append(frame.map(_map, features=new_features))
+    return aligned
+
+
+def _union_top_level_columns(dataframes):
+    """Add columns present on any split (HVTA ``agent_name``) so HF can concat."""
+    merged = {}
+    for frame in dataframes:
+        for key, value in frame.features.items():
+            merged.setdefault(key, value)
+    aligned = []
+    for frame in dataframes:
+        missing = [key for key in merged if key not in frame.features]
+        if not missing:
+            aligned.append(frame)
+            continue
+
+        def _map(example, keys=tuple(missing)):
+            for key in keys:
+                if key == "agent_name":
+                    example[key] = "single_turn_agent"
+                else:
+                    example[key] = None
+            return example
+
+        new_features = frame.features.copy()
+        for key in missing:
+            new_features[key] = merged[key]
+        aligned.append(frame.map(_map, features=new_features))
+    return aligned
+
+
+def _fill_agent_name(dataframe):
+    if "agent_name" not in dataframe.features:
+        return dataframe
+
+    def _map(example):
+        if not example.get("agent_name"):
+            example["agent_name"] = "single_turn_agent"
+        return example
+
+    return dataframe.map(_map)
+
+
+def _cast_large_strings(dataframe):
+    def _rewrite(feature):
+        if isinstance(feature, datasets.Value):
+            return datasets.Value("string") if feature.dtype == "large_string" else feature
+        if isinstance(feature, dict):
+            return {key: _rewrite(value) for key, value in feature.items()}
+        feature_type = type(feature)
+        inner = getattr(feature, "feature", None)
+        if inner is not None:
+            kwargs = {}
+            if hasattr(feature, "length"):
+                kwargs["length"] = feature.length
+            try:
+                return feature_type(_rewrite(inner), **kwargs)
+            except TypeError:
+                return feature
+        return feature
+
+    new_features = datasets.Features(_rewrite(dict(dataframe.features)))
+    if new_features == dataframe.features:
+        return dataframe
+    return dataframe.cast(new_features)
+
+
 class RLHFDataset(Dataset):
     """
     Load and preprocess RLHF data from Parquet files.
@@ -84,6 +256,19 @@ class RLHFDataset(Dataset):
         tokenizer (PreTrainedTokenizer): For the tokenization of text to token IDs.
         config (DictConfig): Options like cache_dir, prompt_key, max_prompt_length, truncation, etc.
         processor (ProcessorMixin, optional): Multimodal preprocessor for images/videos.
+        is_train (bool): Whether this dataset is the training split. Gates `config.train_weights`
+            (see below), which only makes sense for the training pool, not validation.
+
+    `config.train_weights`, an optional list of floats the same length as `data_files`, mixes
+    multiple training datasets at configurable ratios instead of pooling them in proportion to
+    their raw file sizes -- e.g. `train_files: [cdc.parquet, hvta.parquet]` with
+    `train_weights: [0.8, 0.2]` upsamples/downsamples each split so CDC rows end up ~4x HVTA rows
+    in the combined pool, regardless of how large each parquet actually is.
+
+    `config.max_prompt_lengths`, an optional list of ints the same length as `data_files`, filters
+    each source file against its own overlong-prompt threshold instead of one global
+    `config.max_prompt_length` -- e.g. a short-episode dataset (BabyAI) and a longer one (HVTA)
+    mixed together can each keep their own cap. Applied before `train_weights` resampling.
     """
 
     def __init__(
@@ -93,6 +278,7 @@ class RLHFDataset(Dataset):
         config: DictConfig,
         processor: Optional[ProcessorMixin] = None,
         max_samples: int = -1,
+        is_train: bool = True,
     ):
         if not isinstance(data_files, list | ListConfig):
             data_files = [data_files]
@@ -102,6 +288,7 @@ class RLHFDataset(Dataset):
         self.tokenizer = tokenizer
         self.processor = processor
         self.max_samples = max_samples
+        self.is_train = is_train
         self.config = config
 
         self.cache_dir = os.path.expanduser(config.get("cache_dir", "~/.cache/verl/rlhf"))
@@ -177,7 +364,29 @@ class RLHFDataset(Dataset):
             else:
                 raise ValueError(f"Unsupported file format: {parquet_file}")
             dataframes.append(dataframe)
-        self.dataframe: datasets.Dataset = datasets.concatenate_datasets(dataframes)
+
+        # Per-file prompt-length caps (data.max_prompt_lengths, aligned with data.train_files) let
+        # e.g. a short-episode dataset (BabyAI) and a long one (HVTA) each filter against their own
+        # threshold instead of one global data.max_prompt_length -- applied before concatenation
+        # (and before train_weights resampling) so ratios are computed over the already-eligible
+        # rows. Falls back to the single post-concat filter below when unset, unchanged from before.
+        max_prompt_lengths = self.config.get("max_prompt_lengths", None) if self.is_train else None
+        if max_prompt_lengths is not None:
+            if len(max_prompt_lengths) != len(dataframes):
+                raise ValueError(
+                    f"data.max_prompt_lengths has {len(max_prompt_lengths)} entries but data.train_files "
+                    f"has {len(dataframes)} entries; they must be the same length."
+                )
+            dataframes = [
+                self.maybe_filter_out_long_prompts(frame, max_prompt_length=length)
+                for frame, length in zip(dataframes, max_prompt_lengths)
+            ]
+
+        train_weights = self.config.get("train_weights", None) if self.is_train else None
+        if train_weights is not None:
+            dataframes = _resample_dataframes_to_weights(dataframes, train_weights, seed=self.seed)
+
+        self.dataframe: datasets.Dataset = concatenate_rl_dataframes(dataframes)
 
         total = len(self.dataframe)
         print(f"dataset len: {len(self.dataframe)}")
@@ -192,11 +401,15 @@ class RLHFDataset(Dataset):
             self.dataframe = self.dataframe.select(indices.tolist())
             print(f"selected {self.max_samples} random samples out of {total}")
 
-        self.dataframe = self.maybe_filter_out_long_prompts(self.dataframe)
+        if max_prompt_lengths is None:
+            self.dataframe = self.maybe_filter_out_long_prompts(self.dataframe)
 
-    def maybe_filter_out_long_prompts(self, dataframe: datasets.Dataset = None):
+    def maybe_filter_out_long_prompts(
+        self, dataframe: datasets.Dataset = None, max_prompt_length: Optional[int] = None
+    ):
         # filter out too long prompts
         if self.filter_overlong_prompts:
+            max_prompt_length = max_prompt_length if max_prompt_length is not None else self.max_prompt_length
             tokenizer = self.tokenizer
             processor = self.processor
             prompt_key = self.prompt_key
@@ -241,7 +454,7 @@ class RLHFDataset(Dataset):
                     except Exception:
                         print("Error processing one of the samples, skipping...")
                         traceback.print_exc()
-                        return self.max_prompt_length + 1
+                        return max_prompt_length + 1
 
             else:
 
@@ -263,12 +476,12 @@ class RLHFDataset(Dataset):
                     except Exception:
                         print("Error processing one of the samples, skipping...")
                         traceback.print_exc()
-                        return self.max_prompt_length + 1
+                        return max_prompt_length + 1
 
             dataframe = dataframe.filter(
-                lambda doc: doc2len(doc) <= self.max_prompt_length,
+                lambda doc: doc2len(doc) <= max_prompt_length,
                 num_proc=self.num_workers,
-                desc=f"Filtering prompts longer than {self.max_prompt_length} tokens",
+                desc=f"Filtering prompts longer than {max_prompt_length} tokens",
             )
 
             print(f"filter dataset len: {len(dataframe)}")

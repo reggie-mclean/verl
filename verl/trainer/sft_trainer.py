@@ -263,7 +263,12 @@ class SFTTrainer:
                 collate_fn=self.collate_fn,
                 num_workers=self.config.data.num_workers,
                 pin_memory=False,
-                drop_last=True,
+                # Unlike the train loader, drop_last=False here: a val shard
+                # smaller than train_batch_size_per_dp (e.g. a small val set
+                # split across several GPUs) would otherwise yield zero
+                # batches on that rank, making val_losses empty and val/loss
+                # a silent NaN via torch.mean([]) + the cross-rank all_reduce.
+                drop_last=False,
                 pin_memory_device=device_name,
             )
         else:

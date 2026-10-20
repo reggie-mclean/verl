@@ -442,7 +442,15 @@ class PPOTrainer(ABC):
             self.on_validate_end()
             assert val_metrics, f"{val_metrics=}"
             pprint(f"Initial validation metrics: {val_metrics}")
-            self.logger.log(data=val_metrics, step=self.global_steps)
+            # step=None (not self.global_steps, which is always 0 here unless
+            # resuming an actual PPO checkpoint) lets each backend auto-advance
+            # its own step counter instead of asserting an explicit one. A
+            # fresh standalone run's counter already starts at 0, so this is a
+            # no-op there; a val_only eval chained onto an existing wandb run
+            # (see scripts/sft-finetune.sh's rollout-eval chaining) would
+            # otherwise log at step 0 while that run's history is already past
+            # it, which wandb silently drops for violating monotonic steps.
+            self.logger.log(data=val_metrics, step=None)
             if self.config.trainer.get("val_only", False):
                 self._shutdown_dump_executor()
                 return

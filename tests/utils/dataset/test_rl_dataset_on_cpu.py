@@ -18,6 +18,7 @@ import threading
 from copy import deepcopy
 from pathlib import Path
 
+import datasets
 import pytest
 import torch
 from omegaconf import OmegaConf
@@ -26,7 +27,7 @@ from torch.utils.data import DataLoader
 
 from verl import DataProto
 from verl.utils import hf_processor, hf_tokenizer
-from verl.utils.dataset.rl_dataset import RLHFDataset, collate_fn
+from verl.utils.dataset.rl_dataset import RLHFDataset, _resample_dataframes_to_weights, collate_fn
 
 
 def _mock_rlhf_dataset():
@@ -334,3 +335,93 @@ def test_video_rl_data(video_data_file):
     assert "images" not in data_proto.non_tensor_batch
 
     print("raw_prompt", data_proto.non_tensor_batch["raw_prompt"][0])
+
+
+def _toy_dataset(n: int, tag: str) -> datasets.Dataset:
+    return datasets.Dataset.from_dict({"id": list(range(n)), "source": [tag] * n})
+
+
+def test_resample_dataframes_to_weights_matches_target_ratio():
+    frames = [_toy_dataset(100, "a"), _toy_dataset(100, "b")]
+    resampled = _resample_dataframes_to_weights(frames, [0.8, 0.2], seed=0)
+    # total_rows preserved (200), split 80/20 instead of the original 50/50.
+    assert [len(f) for f in resampled] == [160, 40]
+    assert set(resampled[0]["source"]) == {"a"}
+    assert set(resampled[1]["source"]) == {"b"}
+
+
+def test_resample_dataframes_to_weights_oversamples_small_split():
+    # "b" is far smaller than its target weight implies, so it must be upsampled
+    # with replacement (duplicates expected); "a" is downsampled without replacement.
+    frames = [_toy_dataset(100, "a"), _toy_dataset(10, "b")]
+    resampled = _resample_dataframes_to_weights(frames, [0.5, 0.5], seed=0)
+    assert [len(f) for f in resampled] == [55, 55]
+    assert len(set(resampled[1]["id"])) <= 10
+    assert len(set(resampled[0]["id"])) == 55  # downsampling never duplicates
+
+
+def test_resample_dataframes_to_weights_normalizes_weights():
+    frames = [_toy_dataset(100, "a"), _toy_dataset(100, "b")]
+    unnormalized = _resample_dataframes_to_weights(frames, [4, 1], seed=0)
+    normalized = _resample_dataframes_to_weights(frames, [0.8, 0.2], seed=0)
+    assert [len(f) for f in unnormalized] == [len(f) for f in normalized]
+
+
+def test_resample_dataframes_to_weights_length_mismatch_raises():
+    frames = [_toy_dataset(10, "a"), _toy_dataset(10, "b")]
+    with pytest.raises(ValueError, match="train_weights"):
+        _resample_dataframes_to_weights(frames, [1.0], seed=0)
+
+
+def test_resample_dataframes_to_weights_rejects_non_positive_weights():
+    frames = [_toy_dataset(10, "a"), _toy_dataset(10, "b")]
+    with pytest.raises(ValueError, match="non-negative"):
+        _resample_dataframes_to_weights(frames, [0.0, 0.0], seed=0)
+
+
+class _FakeTokenizer:
+    """Stand-in for a real tokenizer: `length` in each prompt message IS the fake token count."""
+
+    def apply_chat_template(self, messages, add_generation_prompt=True, tokenize=True, **kwargs):
+        return list(range(messages[0]["length"]))
+
+
+def _mock_filterable_dataset() -> RLHFDataset:
+    dataset = RLHFDataset.__new__(RLHFDataset)
+    dataset.filter_overlong_prompts = True
+    dataset.tokenizer = _FakeTokenizer()
+    dataset.processor = None
+    dataset.prompt_key = "prompt"
+    dataset.apply_chat_template_kwargs = {}
+    dataset.tool_schemas = None
+    dataset.num_workers = None  # avoid spawning a multiprocessing pool just to filter a toy frame
+    dataset.max_prompt_length = 1024  # global default; override param should win when passed
+    return dataset
+
+
+def _prompt_frame(lengths: list[int]) -> datasets.Dataset:
+    return datasets.Dataset.from_dict(
+        {"prompt": [[{"role": "user", "content": "x", "length": n}] for n in lengths]}
+    )
+
+
+def test_maybe_filter_out_long_prompts_honors_override_length():
+    dataset = _mock_filterable_dataset()
+    frame = _prompt_frame([5, 20, 50])
+
+    # A tight override (10) should win over self.max_prompt_length (1024): only the length-5 row
+    # survives.
+    strict = dataset.maybe_filter_out_long_prompts(frame, max_prompt_length=10)
+    assert len(strict) == 1
+
+    # A looser override still overrides the instance default, not just widens it.
+    loose = dataset.maybe_filter_out_long_prompts(frame, max_prompt_length=30)
+    assert len(loose) == 2
+
+
+def test_maybe_filter_out_long_prompts_falls_back_to_instance_default():
+    dataset = _mock_filterable_dataset()
+    frame = _prompt_frame([5, 2000])
+
+    kept = dataset.maybe_filter_out_long_prompts(frame)
+    assert len(kept) == 1  # only the short row fits under self.max_prompt_length=1024

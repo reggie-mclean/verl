@@ -120,19 +120,27 @@ def create_rl_dataset(data_paths, data_config, tokenizer, processor, is_train=Tr
         dataset (Dataset): The dataset.
     """
 
+    import inspect
+
     from verl.utils.dataset.rl_dataset import get_dataset_class
 
     # Get the dataset class
     dataset_cls = get_dataset_class(data_config)
 
     # Instantiate the dataset using the determined dataset class
-    dataset = dataset_cls(
+    kwargs = dict(
         data_files=data_paths,
         tokenizer=tokenizer,
         processor=processor,
         config=data_config,
         max_samples=max_samples,
     )
+    # custom_cls (data_config.custom_cls) dataset classes may not accept is_train, so only
+    # pass it through when supported -- RLHFDataset (and subclasses) use it to gate
+    # data.train_weights (multi-dataset mixing ratios) to the training split only.
+    if "is_train" in inspect.signature(dataset_cls.__init__).parameters:
+        kwargs["is_train"] = is_train
+    dataset = dataset_cls(**kwargs)
 
     return dataset
 
