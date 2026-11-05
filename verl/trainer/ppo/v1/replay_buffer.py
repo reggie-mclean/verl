@@ -503,6 +503,20 @@ class ReplayBuffer:
             last_debug_time = self._wait_for_next_poll(partition_id, last_debug_time)
 
         selected_uids = set(selected_prompt_uids)
+        # Visibility metric, independent of sync_refill_failed_groups: a selected uid with zero
+        # materializable trajectory rows in partition_snapshot is a group that failed (e.g. an
+        # agent loop's HTTP call to its sidecar/vLLM exhausted retries -- see
+        # AgentLoopWorkerTQ._run_prompt) and is silently contributing nothing to this batch rather
+        # than being refilled. Reported every batch (train AND val) so a regression that starts
+        # producing real failures again shows up in W&B immediately, rather than only surfacing as
+        # the RuntimeError below (train-only, and only once EVERY selected uid is a failure).
+        dropped_uids = selected_uids - {key.split("_")[0] for key in partition_snapshot}
+        # Always set, even when 0 -- an omitted key (vs. an explicit 0) would leave gaps in the
+        # W&B time series instead of a continuous line, making it hard to tell "nothing dropped"
+        # from "this step wasn't reported".
+        eviction_metrics[f"{self._metrics_prefix(partition_id)}/rollout_failure/dropped_groups_in_batch"] = len(
+            dropped_uids
+        )
         if partition_id != "val" and not any(key.split("_")[0] in selected_uids for key in partition_snapshot):
             message = "Sync replay buffer selected terminal groups with no materializable trajectories."
             if not self.sync_refill_failed_groups:

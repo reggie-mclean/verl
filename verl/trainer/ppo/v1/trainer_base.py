@@ -1052,6 +1052,9 @@ class PPOTrainer(ABC):
         session_to_sample_idx: dict[str, int] = {}
         # To avoid failure sessions
         expected_acc_counts: dict[tuple[str, str], int] = {}
+        # Summed across every val_dataloader chunk below -- see the "batch, _ = ..." call's own
+        # comment for why this needs capturing explicitly instead of discarding the metrics tuple.
+        total_dropped_groups = 0
 
         for batch_dict in self.val_dataloader:
             # 1. put batch to agent loop manager
@@ -1081,9 +1084,15 @@ class PPOTrainer(ABC):
             self.agent_loop_manager.generate_sequences(batch)
 
             # 2. sample batch from replay buffer: one prompt (GRPO group) per submitted row.
-            batch, _ = self.replay_buffer.sample(
+            # Captured, not discarded: ReplayBuffer.sample's own metrics dict includes
+            # rollout_failure/dropped_groups_in_batch (a group whose agent loop's HTTP call to its
+            # sidecar/vLLM exhausted retries, contributing nothing to this val chunk) -- this used
+            # to be thrown away here, the one call site that would have caught it for eval_base
+            # (val_only) runs specifically, since the train-path call site already captures it.
+            batch, val_sample_metrics = self.replay_buffer.sample(
                 global_steps=self.global_steps, partition_id="val", batch_size=len(batch)
             )
+            total_dropped_groups += val_sample_metrics.get("validation/rollout_failure/dropped_groups_in_batch", 0)
 
             # 3. [OPTIONAL] compute reward score with colocated reward model
             if self.reward_loop_manager.reward_loop_worker_handles is None:
@@ -1202,13 +1211,17 @@ class PPOTrainer(ABC):
                 dump_path=val_data_dir,
             )
 
-        return self._val_metrics_update(
+        metric_dict = self._val_metrics_update(
             data_sources,
             sample_uids,
             reward_extra_infos_dict,
             sample_turns,
             expected_acc_counts=expected_acc_counts,
         )
+        # Always set, even at 0 -- see ReplayBuffer.sample's own comment on this metric for why an
+        # explicit 0 beats an omitted key.
+        metric_dict["validation/rollout_failure/dropped_groups"] = total_dropped_groups
+        return metric_dict
 
     def _maybe_log_val_generations(self, inputs, outputs, scores):
         """Log a table of validation samples to the configured logger (wandb or swanlab)"""
